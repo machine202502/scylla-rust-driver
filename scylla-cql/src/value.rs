@@ -1512,12 +1512,19 @@ pub fn deser_cql_value(
             let t = type_names
                 .iter()
                 .map(|typ| -> StdResult<_, DeserializationError> {
-                    let raw = types::read_bytes_opt(buf).map_err(|e| {
-                        mk_deser_err::<CqlValue>(
-                            typ,
-                            BuiltinDeserializationErrorKind::RawCqlBytesReadError(e),
-                        )
-                    })?;
+                    let raw = if buf.is_empty() {
+                        // Treat missing trailing tuple elements as nulls.
+                        // This aligns CqlValue dynamic deserialization with typed tuple
+                        // deserialization and with Scylla/Cassandra tuple semantics.
+                        None
+                    } else {
+                        types::read_bytes_opt(buf).map_err(|e| {
+                            mk_deser_err::<CqlValue>(
+                                typ,
+                                BuiltinDeserializationErrorKind::RawCqlBytesReadError(e),
+                            )
+                        })?
+                    };
                     raw.map(|v| CqlValue::deserialize(typ, Some(FrameSlice::new_borrowed(v))))
                         .transpose()
                 })
@@ -1547,9 +1554,12 @@ pub struct Row {
 
 #[cfg(test)]
 mod tests {
+    use bytes::BytesMut;
     use std::str::FromStr as _;
 
     use super::*;
+    use crate::frame::response::result::NativeType;
+    use crate::frame::types::write_bytes;
 
     #[test]
     fn timeuuid_msb_byte_order() {
@@ -1687,6 +1697,26 @@ mod tests {
                 }
             ),
             "{foo:123,bar:321}"
+        );
+    }
+
+    #[test]
+    fn deser_cql_value_tuple_allows_missing_trailing_elements_as_null() {
+        let tuple_type = ColumnType::Tuple(vec![
+            ColumnType::Native(NativeType::Double),
+            ColumnType::Native(NativeType::Double),
+        ]);
+
+        // Serialize only the first tuple element: second one is omitted.
+        // This is valid and should be interpreted as trailing null.
+        let mut raw = BytesMut::new();
+        write_bytes(&48.13_f64.to_be_bytes(), &mut raw).unwrap();
+        let mut raw_slice: &[u8] = &raw;
+
+        let got = deser_cql_value(&tuple_type, &mut raw_slice).unwrap();
+        assert_eq!(
+            got,
+            CqlValue::Tuple(vec![Some(CqlValue::Double(48.13)), None])
         );
     }
 }
